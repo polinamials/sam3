@@ -26,7 +26,8 @@ classifiers = [
 ]
 dependencies = [
     "timm>=1.0.17",
-    "numpy>=1.26,<2",
+    "numpy>=1.26,<2; python_version < '3.14'",
+    "numpy>=2; python_version >= '3.14'",
     "tqdm",
     "ftfy==6.1.1",
     "regex",
@@ -36,6 +37,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+onnx = [
+    "onnx>=1.22",
+    "onnxscript>=0.7",
+    "onnxconverter-common>=1.16",
+]
 dev = [
     "pytest",
     "pytest-cov",

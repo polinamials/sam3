@@ -280,7 +280,9 @@ class TransformerDecoder(nn.Module):
             if resolution is not None and stride is not None:
                 feat_size = resolution // stride
                 coords_h, coords_w = self._get_coords(
-                    feat_size, feat_size, device="cuda"
+                    feat_size,
+                    feat_size,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
                 )
                 self.compilable_cord_cache = (coords_h, coords_w)
                 self.compilable_stored_size = (feat_size, feat_size)
@@ -338,7 +340,7 @@ class TransformerDecoder(nn.Module):
             self.compilable_cord_cache = self._get_coords(H, W, reference_boxes.device)
             self.compilable_stored_size = (H, W)
 
-        if torch.compiler.is_dynamo_compiling() or self.compilable_stored_size == (
+        if torch.compiler.is_compiling() or self.compilable_stored_size == (
             H,
             W,
         ):
@@ -393,19 +395,19 @@ class TransformerDecoder(nn.Module):
             act_ckpt_enable=self.training and self.use_act_checkpoint,
         )  # bs, num_queries, H, n_heads
 
-        if not torch.compiler.is_dynamo_compiling():
+        if not torch.compiler.is_compiling():
             assert deltas_x.shape[:3] == (bs, num_queries, W)
             assert deltas_y.shape[:3] == (bs, num_queries, H)
 
         B = deltas_y.unsqueeze(3) + deltas_x.unsqueeze(
             2
         )  # bs, num_queries, H, W, n_heads
-        if not torch.compiler.is_dynamo_compiling():
+        if not torch.compiler.is_compiling():
             assert B.shape[:4] == (bs, num_queries, H, W)
         B = B.flatten(2, 3)  # bs, num_queries, H*W, n_heads
         B = B.permute(0, 3, 1, 2)  # bs, n_heads, num_queries, H*W
         B = B.contiguous()  # memeff attn likes ordered strides
-        if not torch.compiler.is_dynamo_compiling():
+        if not torch.compiler.is_compiling():
             assert B.shape[2:] == (num_queries, H * W)
         return B
 
