@@ -134,7 +134,13 @@ class TransformerDecoderLayer(nn.Module):
                 )
 
             q = k = self.with_pos_embed(tgt_o2o, tgt_query_pos_o2o)
-            tgt2 = self.self_attn(q, k, tgt_o2o, attn_mask=self_attn_mask)[0]
+            tgt2 = self.self_attn(
+                q,
+                k,
+                tgt_o2o,
+                attn_mask=self_attn_mask,
+                need_weights=False,
+            )[0]
             tgt_o2o = tgt_o2o + self.dropout2(tgt2)
             if dac:
                 if not dac_use_selfatt_ln:
@@ -152,6 +158,7 @@ class TransformerDecoderLayer(nn.Module):
                 memory_text,
                 memory_text,
                 key_padding_mask=text_attention_mask,
+                need_weights=False,
             )[0]
             tgt = tgt + self.catext_dropout(tgt2)
             tgt = self.catext_norm(tgt)
