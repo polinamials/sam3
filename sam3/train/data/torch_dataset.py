@@ -38,6 +38,7 @@ class TorchDataset:
         if self.sampler:
             self.sampler.set_epoch(epoch)
         if hasattr(self.dataset, "epoch"):
+            # pyrefly: ignore [missing-attribute]
             self.dataset.epoch = epoch
         if hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(epoch)

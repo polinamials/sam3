@@ -77,9 +77,11 @@ class ResidualAttentionBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         k_x = (
+            # pyrefly: ignore [not-callable]
             self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
         )
         v_x = (
+            # pyrefly: ignore [not-callable]
             self.ln_1_kv(v_x) if hasattr(self, "ln_1_kv") and v_x is not None else None
         )
         x = q_x + self.ls_1(
@@ -289,6 +291,7 @@ class VETextEncoder(nn.Module):
         self,
         text: Union[List[str], Tuple[torch.Tensor, torch.Tensor, dict]],
         input_boxes: Optional[List] = None,
+        # pyrefly: ignore [bad-function-definition]
         device: torch.device = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if isinstance(text[0], str):

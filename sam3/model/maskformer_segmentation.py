@@ -18,6 +18,7 @@ class LinearPresenceHead(nn.Sequential):
         # a hack to make `LinearPresenceHead` compatible with old checkpoints
         super().__init__(nn.Identity(), nn.Identity(), nn.Linear(d_model, 1))
 
+    # pyrefly: ignore [bad-override]
     def forward(self, hs, prompt, prompt_mask):
         return super().forward(hs)
 
@@ -279,6 +280,7 @@ class UniversalSegmentationHead(SegmentationHead):
             self.pixel_decoder.out_dim, self.d_model, kernel_size=1
         )
 
+    # pyrefly: ignore [bad-override]
     def forward(
         self,
         backbone_feats: List[torch.Tensor],
@@ -304,6 +306,7 @@ class UniversalSegmentationHead(SegmentationHead):
 
         presence_logit = None
         if self.presence_head is not None:
+            # pyrefly: ignore [missing-attribute]
             pooled_enc = encoder_hidden_states.mean(0)
             presence_logit = (
                 self.presence_head(

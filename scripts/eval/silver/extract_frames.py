@@ -16,6 +16,8 @@ from multiprocessing import Pool
 
 from PIL import Image
 from tqdm import tqdm
+
+# pyrefly: ignore [missing-import]
 from utils import (
     annotation_files,
     config,
@@ -59,7 +61,7 @@ def process_image(args):
         if not is_valid_image(path_frame):
             print(f"Invalid image in {path_frame}")
             to_return = None
-    except:
+    except Exception:
         print(f"Invalid image in {path_frame}")
         to_return = None
     return to_return

@@ -97,21 +97,25 @@ class PromptEncoder(nn.Module):
         )
         point_embedding = torch.where(
             (labels == 0).unsqueeze(-1),
+            # pyrefly: ignore [unsupported-operation]
             point_embedding + self.point_embeddings[0].weight,
             point_embedding,
         )
         point_embedding = torch.where(
             (labels == 1).unsqueeze(-1),
+            # pyrefly: ignore [unsupported-operation]
             point_embedding + self.point_embeddings[1].weight,
             point_embedding,
         )
         point_embedding = torch.where(
             (labels == 2).unsqueeze(-1),
+            # pyrefly: ignore [unsupported-operation]
             point_embedding + self.point_embeddings[2].weight,
             point_embedding,
         )
         point_embedding = torch.where(
             (labels == 3).unsqueeze(-1),
+            # pyrefly: ignore [unsupported-operation]
             point_embedding + self.point_embeddings[3].weight,
             point_embedding,
         )
@@ -124,7 +128,9 @@ class PromptEncoder(nn.Module):
         corner_embedding = self.pe_layer.forward_with_coords(
             coords, self.input_image_size
         )
+        # pyrefly: ignore [unsupported-operation]
         corner_embedding[:, 0, :] += self.point_embeddings[2].weight
+        # pyrefly: ignore [unsupported-operation]
         corner_embedding[:, 1, :] += self.point_embeddings[3].weight
         return corner_embedding
 
@@ -152,6 +158,7 @@ class PromptEncoder(nn.Module):
             return 1
 
     def _get_device(self) -> torch.device:
+        # pyrefly: ignore [bad-return]
         return self.point_embeddings[0].weight.device
 
     def forward(

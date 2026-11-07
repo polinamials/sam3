@@ -744,9 +744,10 @@ class Sam3VideoInference(Sam3VideoBase):
         high_res_H, high_res_W = (
             self.tracker.maskmem_backbone.mask_downsampler.interpol_size
         )
+        # Citrine C3: allocate directly on the tracker device.
         new_det_masks = torch.ones(
-            len(new_det_obj_ids_local), high_res_H, high_res_W
-        ).to(self.device)
+            len(new_det_obj_ids_local), high_res_H, high_res_W, device=self.device
+        )
 
         inference_state["tracker_inference_states"] = self._tracker_add_new_objects(
             frame_idx=frame_idx,
@@ -911,7 +912,9 @@ class Sam3VideoInference(Sam3VideoBase):
         # set the model to single GPU for benchmark evaluation (to be compatible with trainer)
         orig_rank = self.rank
         orig_world_size = self.world_size
+        # pyrefly: ignore [bad-argument-type]
         self.rank = self.detector.rank = 0
+        # pyrefly: ignore [bad-argument-type]
         self.world_size = self.detector.world_size = 1
 
         # get data
@@ -952,13 +955,74 @@ class Sam3VideoInference(Sam3VideoBase):
         preds = self.prep_for_evaluator(input.raw_images, tracking_res, scores_labels)
 
         # revert the model to the original GPU and rank
+        # pyrefly: ignore [bad-argument-type]
         self.rank = self.detector.rank = orig_rank
+        # pyrefly: ignore [bad-argument-type]
         self.world_size = self.detector.world_size = orig_world_size
         return {video_id: preds}
 
     def back_convert(self, targets):
         # Needed for retraining compatibility with trainer
         return targets
+
+
+def grow_masklet_confirmation(
+    confirmation, obj_count, obj_idx, seeds_the_object
+) -> bool:
+    """Make the masklet-confirmation arrays cover `obj_count` objects.
+
+    They are indexed by position in `obj_ids_all_gpu`, which is the per-GPU id
+    arrays concatenated, so an object added to any but the last populated GPU
+    lands in the middle of it and shifts every later index by one. Growing at
+    the tail would leave the stored `status` and `consecutive_det_num` attached
+    to the wrong objects, so the new object is inserted at its own index.
+
+    Only the single-object growth this pass performs is representable, and only
+    when `seeds_the_object` says this call is what registered it -- that is what
+    makes `obj_idx` the slot that went missing. A wider gap, or a refine that
+    finds the arrays short, means they fell out of step somewhere else
+    (`add_tracker_new_points` seeds objects without ever growing them), and
+    every insert position is then a guess that silently re-keys the objects
+    after it. Left alone in that case: raising here would abort after the
+    object had already been registered, leaving the session half-updated.
+
+    Returns True only when both arrays end up exactly `obj_count` long, which
+    is the only state in which a position means what the caller thinks. A
+    caller must not write through `obj_idx` when this is False: the arrays are
+    out of step, so an in-bounds `obj_idx` addresses some other object.
+
+    Everything else is left alone, including arrays that are *longer* than
+    `obj_count` and arrays whose two halves disagree with each other. Both are
+    as misaligned as a wider gap -- an object removed without shrinking them
+    leaves a stale entry under every later index -- and raising here would
+    abort after the object had already been registered, leaving the session
+    half-updated.
+    """
+    status_len = len(confirmation["status"])
+    det_len = len(confirmation["consecutive_det_num"])
+    if status_len == obj_count and det_len == obj_count:
+        return True
+    # Only a single object short, in both halves at once, is representable --
+    # and only when `obj_idx` is the slot that went missing, which is true
+    # exactly when this call is what registered the object. Refining a
+    # pre-existing object can leave the arrays one short too, but the missing
+    # slot then belongs to whichever object `add_tracker_new_points` seeded
+    # without growing them; inserting at the refined object's index would shift
+    # every entry between the two onto the wrong masklet.
+    if (
+        seeds_the_object
+        and obj_idx is not None
+        and status_len == det_len == obj_count - 1
+    ):
+        for key in ("status", "consecutive_det_num"):
+            confirmation[key] = np.insert(confirmation[key], obj_idx, 0)
+        return True
+    logger.warning(
+        f"masklet confirmation holds {status_len} status and {det_len} "
+        f"consecutive_det_num entries for {obj_count} objects; leaving it "
+        "alone rather than guessing how to realign them"
+    )
+    return False
 
 
 class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
@@ -993,17 +1057,22 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         )
 
     @torch.inference_mode()
-    def propagate_in_video(
+    def propagate_in_video(  # noqa: C901
         self,
         inference_state,
         start_frame_idx=None,
         max_frame_num_to_track=None,
         reverse=False,
+        force_tracker_propagation=False,
     ):
-        # step 1: check which type of propagation to run, should be the same for all GPUs.
-        propagation_type, obj_ids = self.parse_action_history_for_propagation(
-            inference_state
-        )
+        # Observation-conditioned callers explicitly run both directions. Do not
+        # let a boundary-started first pass turn the second into a cache fetch.
+        if force_tracker_propagation:
+            propagation_type, obj_ids = self._forced_propagation(inference_state)
+        else:
+            propagation_type, obj_ids = self.parse_action_history_for_propagation(
+                inference_state
+            )
         self.add_action_history(
             inference_state,
             action_type=propagation_type,
@@ -1096,46 +1165,16 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
 
                 # broadcast refined object tracker scores and masks to all GPUs
                 # handle multiple objects that can be located on different GPUs
-                refined_obj_data = {}  # obj_id -> (score, mask_video_res)
-
-                # Collect data for objects on this GPU
-                local_obj_data = {}
-                for obj_id in obj_ids:
-                    obj_rank = self._get_gpu_id_by_obj_id(inference_state, obj_id)
-                    if self.rank == obj_rank and obj_id in obj_ids_local:
-                        refined_obj_idx = obj_ids_local.index(obj_id)
-                        refined_mask_low_res = low_res_masks_local[
-                            refined_obj_idx
-                        ]  # (H_low_res, W_low_res)
-                        refined_score = tracker_scores_local[refined_obj_idx]
-
-                        # Keep low resolution for broadcasting to reduce communication cost
-                        local_obj_data[obj_id] = (refined_score, refined_mask_low_res)
-
-                # Broadcast data from each GPU that has refined objects
-                if self.world_size > 1:
-                    for obj_id in obj_ids:
-                        obj_rank = self._get_gpu_id_by_obj_id(inference_state, obj_id)
-                        if self.rank == obj_rank:
-                            # This GPU has the object, broadcast its data
-                            data_to_broadcast = local_obj_data.get(obj_id, None)
-                            data_list = [
-                                (data_to_broadcast[0].cpu(), data_to_broadcast[1].cpu())
-                            ]
-                            self.broadcast_python_obj_cpu(data_list, src=obj_rank)
-                            if data_to_broadcast is not None:
-                                refined_obj_data[obj_id] = data_to_broadcast
-                        elif self.rank != obj_rank:
-                            # This GPU doesn't have the object, receive data
-                            data_list = [None]
-                            self.broadcast_python_obj_cpu(data_list, src=obj_rank)
-                            refined_obj_data[obj_id] = (
-                                data_list[0][0].to(self.device),
-                                data_list[0][1].to(self.device),
-                            )
-                else:
-                    # Single GPU case
-                    refined_obj_data = local_obj_data
+                local_obj_data = self._collect_local_refined_objects(
+                    inference_state,
+                    obj_ids,
+                    obj_ids_local,
+                    low_res_masks_local,
+                    tracker_scores_local,
+                )
+                refined_obj_data = self._share_refined_objects(
+                    inference_state, obj_ids, local_obj_data
+                )
 
                 # Update Tracker scores for all refined objects
                 for obj_id, (refined_score, _) in refined_obj_data.items():
@@ -1187,6 +1226,85 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                     )
                 else:
                     yield frame_idx, None
+
+    @staticmethod
+    def _forced_propagation(inference_state):
+        """The propagation a forced pass should run, and the objects it covers.
+
+        `tracker_metadata` is populated lazily by `add_tracker_new_mask` /
+        `add_tracker_new_points`, so a forced pass issued before any object was
+        added has no `obj_ids_all_gpu` key and no tracker state to propagate.
+        Falling back to a full pass is what `parse_action_history_for_propagation`
+        does with an empty history; reading the key unconditionally raised
+        `KeyError`, and an empty id list took the partial path with nothing in it.
+        """
+        metadata = inference_state.get("tracker_metadata") or {}
+        obj_ids_all_gpu = metadata.get("obj_ids_all_gpu")
+        if obj_ids_all_gpu is None:
+            return "propagation_full", None
+        obj_ids = obj_ids_all_gpu.tolist()
+        if not obj_ids:
+            return "propagation_full", None
+        return "propagation_partial", obj_ids
+
+    def _collect_local_refined_objects(
+        self,
+        inference_state,
+        obj_ids,
+        obj_ids_local,
+        low_res_masks_local,
+        tracker_scores_local,
+    ):
+        """This rank's refined (score, low-res mask) for each object it owns.
+
+        Left at low resolution deliberately: the result is broadcast to every
+        rank, and upscaling first multiplies the payload without adding
+        information.
+        """
+        local_obj_data = {}
+        for obj_id in obj_ids:
+            obj_rank = self._get_gpu_id_by_obj_id(inference_state, obj_id)
+            if self.rank == obj_rank and obj_id in obj_ids_local:
+                refined_obj_idx = obj_ids_local.index(obj_id)
+                local_obj_data[obj_id] = (
+                    tracker_scores_local[refined_obj_idx],
+                    low_res_masks_local[refined_obj_idx],
+                )
+        return local_obj_data
+
+    def _share_refined_objects(self, inference_state, obj_ids, local_obj_data):
+        """Every rank's view of every refined object, after the broadcast."""
+        if self.world_size == 1:
+            return local_obj_data
+        refined_obj_data = {}  # obj_id -> (score, low-res mask)
+        for obj_id in obj_ids:
+            obj_rank = self._get_gpu_id_by_obj_id(inference_state, obj_id)
+            # An object can be mapped to this rank while absent from its local
+            # tracker state (metadata and tracker momentarily out of sync). The
+            # broadcast still has to run on every rank for every object, so the
+            # payload carries the absence rather than the rank skipping the call.
+            if self.rank == obj_rank:
+                # This GPU has the object, broadcast its data
+                data_to_broadcast = local_obj_data.get(obj_id, None)
+                data_list = [
+                    None
+                    if data_to_broadcast is None
+                    else (data_to_broadcast[0].cpu(), data_to_broadcast[1].cpu())
+                ]
+                self.broadcast_python_obj_cpu(data_list, src=obj_rank)
+                if data_to_broadcast is not None:
+                    refined_obj_data[obj_id] = data_to_broadcast
+            else:
+                # This GPU doesn't have the object, receive data
+                data_list = [None]
+                self.broadcast_python_obj_cpu(data_list, src=obj_rank)
+                received = data_list[0]
+                if received is not None:
+                    refined_obj_data[obj_id] = (
+                        received[0].to(self.device),
+                        received[1].to(self.device),
+                    )
+        return refined_obj_data
 
     def add_action_history(
         self, inference_state, action_type, frame_idx=None, obj_ids=None
@@ -1395,6 +1513,166 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 boxes_xywh=boxes_xywh,
                 box_labels=box_labels,
             )
+
+    def _confirm_masklet(self, tracker_metadata, obj_id, seeds_the_object):
+        """Rank 0's bookkeeping for an object an exact mask just asserted.
+
+        A caller-supplied mask is authoritative, so the object stops being
+        removed or suppressed and its masklet counts as confirmed outright
+        rather than after the usual consecutive detections.
+        """
+        rank0_metadata = tracker_metadata.get("rank0_metadata", {})
+        rank0_metadata.get("removed_obj_ids", set()).discard(obj_id)
+        for suppressed in rank0_metadata.get("suppressed_obj_ids", {}).values():
+            suppressed.discard(obj_id)
+        confirmation = rank0_metadata.get("masklet_confirmation")
+        if confirmation is None:
+            return
+        obj_ids_all_gpu = tracker_metadata["obj_ids_all_gpu"]
+        obj_indices = np.where(obj_ids_all_gpu == obj_id)[0]
+        obj_idx = int(obj_indices[0]) if len(obj_indices) > 0 else None
+        # Also on a refine: `add_tracker_new_points` never grows these arrays,
+        # so an object seeded through that path arrives here with them short,
+        # and skipping the growth would leave the mask unable to confirm it.
+        in_step = grow_masklet_confirmation(
+            confirmation, len(obj_ids_all_gpu), obj_idx, seeds_the_object
+        )
+        if not in_step or obj_idx is None:
+            return
+        confirmation["status"][obj_idx] = MaskletConfirmationStatus.CONFIRMED.value
+        confirmation["consecutive_det_num"][obj_idx] = (
+            self.masklet_confirmation_consecutive_det_thresh
+        )
+
+    @torch.inference_mode()
+    def add_tracker_new_mask(
+        self,
+        inference_state,
+        frame_idx,
+        obj_id,
+        mask,
+    ):
+        """Add or refine one tracker object from an exact binary mask."""
+        assert obj_id is not None, "obj_id must be provided to add a mask"
+        assert mask.dim() == 2, f"mask must be HxW, got {mask.shape}"
+        tracker_metadata = inference_state["tracker_metadata"]
+        if tracker_metadata == {}:
+            tracker_metadata.update(self._initialize_metadata())
+
+        obj_rank = self._get_gpu_id_by_obj_id(inference_state, obj_id)
+        # Whether *this* call is the one that registers the object. Only then is
+        # its index the slot the confirmation arrays are missing; on a refine
+        # they are already supposed to cover it.
+        seeds_the_object = obj_rank is None
+        if obj_rank is None:
+            num_prev_obj = np.sum(tracker_metadata["num_obj_per_gpu"])
+            if num_prev_obj >= self.max_num_objects:
+                raise RuntimeError(
+                    f"Cannot add object {obj_id}: already tracking "
+                    f"{num_prev_obj} objects (limit {self.max_num_objects})."
+                )
+            obj_rank = self._assign_new_det_to_gpus(
+                new_det_num=1,
+                prev_workload_per_gpu=tracker_metadata["num_obj_per_gpu"],
+            )[0]
+            if self.rank == obj_rank:
+                tracker_state = self._init_new_tracker_state(inference_state)
+                inference_state["tracker_inference_states"].append(tracker_state)
+            tracker_metadata["obj_ids_per_gpu"][obj_rank] = np.concatenate(
+                [
+                    tracker_metadata["obj_ids_per_gpu"][obj_rank],
+                    np.array([obj_id], dtype=np.int64),
+                ]
+            )
+            tracker_metadata["num_obj_per_gpu"][obj_rank] = len(
+                tracker_metadata["obj_ids_per_gpu"][obj_rank]
+            )
+            tracker_metadata["obj_ids_all_gpu"] = np.concatenate(
+                tracker_metadata["obj_ids_per_gpu"]
+            )
+            tracker_metadata["max_obj_id"] = max(tracker_metadata["max_obj_id"], obj_id)
+            self.add_action_history(
+                inference_state, "add", frame_idx=frame_idx, obj_ids=[obj_id]
+            )
+        else:
+            if self.rank == obj_rank:
+                tracker_states = self._get_tracker_inference_states_by_obj_ids(
+                    inference_state, [obj_id]
+                )
+                assert len(tracker_states) == 1, (
+                    f"[rank={self.rank}] Multiple Tracker states found for object "
+                    f"{obj_id}."
+                )
+                tracker_state = tracker_states[0]
+            self.add_action_history(
+                inference_state, "refine", frame_idx=frame_idx, obj_ids=[obj_id]
+            )
+
+        # After the object-limit check, so a call that is going to be refused
+        # does not first pay for a backbone pass it cannot use.
+        self._prepare_backbone_feats(inference_state, frame_idx, reverse=False)
+
+        tracker_metadata["obj_id_to_score"][obj_id] = 1.0
+        tracker_metadata["obj_id_to_tracker_score_frame_wise"][frame_idx][obj_id] = 1.0
+        if self.rank == 0:
+            self._confirm_masklet(tracker_metadata, obj_id, seeds_the_object)
+
+        new_mask_data = None
+        if self.rank == obj_rank:
+            _, obj_ids, _, video_res_masks = self.tracker.add_new_mask(
+                inference_state=tracker_state,
+                frame_idx=frame_idx,
+                obj_id=obj_id,
+                mask=mask,
+                add_mask_to_memory=True,
+            )
+            self.tracker.propagate_in_video_preflight(
+                tracker_state, run_mem_encoder=True
+            )
+            # Unlike point refinement, this frame is itself an authoritative
+            # mask-only conditioning frame. Clearing nearby mask conditioning
+            # frames here would erase the observation we just inserted.
+            if video_res_masks is not None and obj_id in obj_ids:
+                new_mask_data = (video_res_masks[obj_ids.index(obj_id)] > 0.0).to(
+                    torch.bool
+                )
+
+        if self.world_size > 1:
+            data_list = [new_mask_data.cpu() if new_mask_data is not None else None]
+            self.broadcast_python_obj_cpu(data_list, src=obj_rank)
+            new_mask_data = (
+                data_list[0].to(self.device) if data_list[0] is not None else None
+            )
+
+        inference_state["previous_stages_out"][frame_idx] = "_THIS_FRAME_HAS_OUTPUTS_"
+        if self.rank != 0:
+            return frame_idx, None
+        obj_id_to_mask = self._build_tracker_output(
+            inference_state,
+            frame_idx,
+            {obj_id: new_mask_data} if new_mask_data is not None else None,
+        )
+        suppressed_obj_ids = (
+            tracker_metadata.get("rank0_metadata", {})
+            .get("suppressed_obj_ids", {})
+            .get(frame_idx, set())
+        )
+        out = {
+            "obj_id_to_mask": obj_id_to_mask,
+            "obj_id_to_score": tracker_metadata["obj_id_to_score"],
+            "obj_id_to_tracker_score": tracker_metadata[
+                "obj_id_to_tracker_score_frame_wise"
+            ][frame_idx],
+        }
+        self._cache_frame_outputs(
+            inference_state,
+            frame_idx,
+            obj_id_to_mask,
+            suppressed_obj_ids=suppressed_obj_ids,
+        )
+        return frame_idx, self._postprocess_output(
+            inference_state, out, suppressed_obj_ids=suppressed_obj_ids
+        )
 
     @torch.inference_mode()
     def add_tracker_new_points(

@@ -504,6 +504,7 @@ class SequenceGeometryEncoder(nn.Module):
         roi_size: int = 7,  # for boxes pool
         add_cls: bool = True,
         add_post_encode_proj: bool = True,
+        # pyrefly: ignore [bad-function-definition]
         mask_encoder: MaskEncoder = None,
         add_mask_label: bool = False,
         use_act_ckpt: bool = False,
@@ -685,6 +686,7 @@ class SequenceGeometryEncoder(nn.Module):
         masks: torch.Tensor,
         attn_mask: torch.Tensor,
         mask_labels: torch.Tensor,
+        # pyrefly: ignore [bad-function-definition]
         img_feats: torch.Tensor = None,
     ):
         n_masks, bs = masks.shape[:2]
@@ -756,9 +758,11 @@ class SequenceGeometryEncoder(nn.Module):
             labels_br = geo_prompt.box_labels + 4
 
             # Append to the existing points
+            # pyrefly: ignore [bad-unpacking]
             points, _ = concat_padded_sequences(
                 points, points_mask, top_left, boxes_mask
             )
+            # pyrefly: ignore [bad-unpacking]
             points_labels, points_mask = concat_padded_sequences(
                 points_labels.unsqueeze(-1),
                 points_mask,
@@ -767,9 +771,11 @@ class SequenceGeometryEncoder(nn.Module):
             )
             points_labels = points_labels.squeeze(-1)
 
+            # pyrefly: ignore [bad-unpacking]
             points, _ = concat_padded_sequences(
                 points, points_mask, bottom_right, boxes_mask
             )
+            # pyrefly: ignore [bad-unpacking]
             points_labels, points_mask = concat_padded_sequences(
                 points_labels.unsqueeze(-1),
                 points_mask,
@@ -793,6 +799,7 @@ class SequenceGeometryEncoder(nn.Module):
                 img_feats=img_feats,
             )
 
+            # pyrefly: ignore [bad-unpacking]
             final_embeds, final_mask = concat_padded_sequences(
                 final_embeds, final_mask, boxes_embeds, boxes_mask
             )
@@ -813,6 +820,7 @@ class SequenceGeometryEncoder(nn.Module):
             cls_mask = torch.zeros(
                 bs, 1, dtype=final_mask.dtype, device=final_mask.device
             )
+            # pyrefly: ignore [bad-unpacking]
             final_embeds, final_mask = concat_padded_sequences(
                 final_embeds, final_mask, cls, cls_mask
             )
@@ -832,7 +840,12 @@ class SequenceGeometryEncoder(nn.Module):
             final_embeds = self.encode_norm(final_embeds)
         # Finally, concat mask embeddings if any
         if masks is not None and self.mask_encoder is not None:
+            # pyrefly: ignore [bad-unpacking]
             final_embeds, final_mask = concat_padded_sequences(
-                final_embeds, final_mask, masks_embed, masks_mask
+                final_embeds,
+                final_mask,
+                # pyrefly: ignore [unbound-name]
+                masks_embed,
+                masks_mask,
             )
         return final_embeds, final_mask

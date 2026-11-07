@@ -315,6 +315,7 @@ class MultiplexMaskDecoder(nn.Module):
             upscaled_embedding = self.output_upscaling(src)
         else:
             dc1, ln1, act1, dc2, act2 = self.output_upscaling
+            # pyrefly: ignore [not-iterable]
             feat_s0, feat_s1 = high_res_features
             upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
@@ -361,11 +362,13 @@ class MultiplexMaskDecoder(nn.Module):
                 and not self.decode_mask_with_shared_tokens
             ):
                 object_score_logits = (
+                    # pyrefly: ignore [unbound-name]
                     self.pred_obj_score_head(obj_score_token_out)
                     .view(b, self.multiplex_count, self.num_mask_output_per_object)
                     .sum(-1, keepdim=True)
                 )
             else:
+                # pyrefly: ignore [unbound-name]
                 object_score_logits = self.pred_obj_score_head(obj_score_token_out)
         else:
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1

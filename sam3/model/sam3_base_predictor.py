@@ -29,6 +29,11 @@ logger = get_logger(__name__)
 _CLEAR_CACHE_THRESHOLD = 80
 
 
+def _evict_cached_frame_output(inference_state, frame_idx, enabled):
+    if enabled:
+        inference_state.get("cached_frame_outputs", {}).pop(frame_idx, None)
+
+
 class Sam3BasePredictor:
     """
     Base class for SAM3 video predictors. Provides:
@@ -75,11 +80,21 @@ class Sam3BasePredictor:
                 obj_id=request.get("obj_id", None),
                 rel_coordinates=request.get("rel_coordinates", True),
             )
+        elif request_type == "add_mask":
+            return self.add_mask(
+                session_id=request["session_id"],
+                frame_idx=request["frame_index"],
+                obj_id=request["obj_id"],
+                mask=request["mask"],
+            )
         elif request_type == "remove_object":
             return self.remove_object(
                 session_id=request["session_id"],
                 frame_idx=request.get("frame_index", 0),
                 obj_id=request["obj_id"],
+                # Programmatic pruning before propagation must pass False: a history of
+                # only user removals makes propagation return the cached seed frame.
+                is_user_action=request.get("is_user_action", True),
             )
         elif request_type == "reset_session":
             return self.reset_session(session_id=request["session_id"])
@@ -109,6 +124,12 @@ class Sam3BasePredictor:
                 output_prob_thresh=request.get(
                     "output_prob_thresh",
                     getattr(self, "default_output_prob_thresh", 0.5),
+                ),
+                force_tracker_propagation=request.get(
+                    "force_tracker_propagation", False
+                ),
+                evict_cached_frame_outputs=request.get(
+                    "evict_cached_frame_outputs", False
                 ),
             )
         else:
@@ -206,6 +227,31 @@ class Sam3BasePredictor:
             frame_idx, outputs = self.model.add_prompt(**filtered_kwargs)
         return {"frame_index": frame_idx, "outputs": outputs}
 
+    def add_mask(self, session_id: str, frame_idx: int, obj_id: int, mask):
+        """Condition one caller-specified tracker object with a binary mask."""
+        session = self._get_session(session_id)
+        inference_state = session["state"]
+        self._extend_expiration_time(session)
+        # Only the instance-interactivity model takes a caller mask; the
+        # multiplex model exposes point-based tracker APIs instead. Probed the
+        # way the other handlers here probe, so a request routed to a model
+        # that cannot serve it says so rather than raising `AttributeError`
+        # from inside the autocast block.
+        if not hasattr(self.model, "add_tracker_new_mask"):
+            raise NotImplementedError(
+                f"{type(self.model).__name__} does not support add_mask: it has "
+                "no `add_tracker_new_mask`. Use a point or box prompt instead."
+            )
+        mask_tensor = torch.as_tensor(mask, dtype=torch.bool)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            result_frame, outputs = self.model.add_tracker_new_mask(
+                inference_state=inference_state,
+                frame_idx=frame_idx,
+                obj_id=obj_id,
+                mask=mask_tensor,
+            )
+        return {"frame_index": result_frame, "outputs": outputs}
+
     def remove_object(
         self,
         session_id: str,
@@ -260,6 +306,8 @@ class Sam3BasePredictor:
         start_frame_idx=None,
         max_frame_num_to_track=None,
         output_prob_thresh=0.5,
+        force_tracker_propagation=False,
+        evict_cached_frame_outputs=False,
         **kwargs,
     ):
         """Propagate the added prompts to get results on all video frames."""
@@ -283,6 +331,10 @@ class Sam3BasePredictor:
             sig = inspect.signature(self.model.propagate_in_video)
             if "output_prob_thresh" in sig.parameters:
                 propagate_kwargs["output_prob_thresh"] = output_prob_thresh
+            if "force_tracker_propagation" in sig.parameters:
+                propagate_kwargs["force_tracker_propagation"] = (
+                    force_tracker_propagation
+                )
             for k, v in kwargs.items():
                 if k in sig.parameters:
                     propagate_kwargs[k] = v
@@ -293,6 +345,9 @@ class Sam3BasePredictor:
                     **propagate_kwargs,
                     reverse=False,
                 ):
+                    _evict_cached_frame_output(
+                        inference_state, frame_idx, evict_cached_frame_outputs
+                    )
                     yield {"frame_index": frame_idx, "outputs": outputs}
             # Backward propagation
             if propagation_direction in ["both", "backward"]:
@@ -300,6 +355,9 @@ class Sam3BasePredictor:
                     **propagate_kwargs,
                     reverse=True,
                 ):
+                    _evict_cached_frame_output(
+                        inference_state, frame_idx, evict_cached_frame_outputs
+                    )
                     yield {"frame_index": frame_idx, "outputs": outputs}
         finally:
             logger.info(f"propagation ended in session {session_id}")
@@ -404,6 +462,7 @@ class Sam3BasePredictor:
                         f"{post_gpu_mem['reserved_bytes']} bytes)"
                     )
                     gpu_mem = post_gpu_mem
+                # pyrefly: ignore [bad-assignment]
                 result["gpu_mem"] = gpu_mem
             logger.info(f"removed session {session_id}")
         return result
